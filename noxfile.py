@@ -4,6 +4,9 @@
 
 from __future__ import annotations
 
+import glob
+import json
+
 import nox
 
 nox.options.reuse_existing_virtualenvs = True
@@ -144,3 +147,75 @@ def rust(session: nox.Session) -> None:
         session.run("cargo", "fmt", "--all", "--", "--check", external=True)
         session.run("cargo", "clippy", "--", "-D", "warnings", external=True)
         session.run("cargo", "test", "--no-default-features", external=True)
+
+
+@nox.session
+def rust_coverage(session: nox.Session) -> None:
+    session.env.update(
+        {
+            "RUSTFLAGS": "-Cinstrument-coverage",
+            "LLVM_PROFILE_FILE": "rust-cov/cov-%p.profraw",
+        }
+    )
+    # cryptography will be install command in the tests function
+    tests(session)
+
+    with session.chdir("src/rust/"):
+        session.run("cargo", "test", "--no-default-features", external=True)
+        paths = glob.glob("**/*.profraw", recursive=True)
+        session.run(
+            "cargo",
+            "profdata",
+            "--",
+            "merge",
+            "-sparse",
+            *paths,
+            "-o",
+            "rust-cov.profdata",
+            external=True,
+        )
+
+        json_blobs = session.run(
+            "cargo",
+            "test",
+            "--no-default-features",
+            "--all",
+            "--tests",
+            "--no-run",
+            "-q",
+            "--message-format=json",
+            external=True,
+            silent=True,
+        )
+        filenames = []
+        if json_blobs:
+            assert isinstance(json_blobs, str)
+            for blob in json_blobs.splitlines():
+                data = json.loads(blob)
+                try:
+                    if data["profile"]["test"]:
+                        assert len(data["filenames"]) == 1
+                        filenames.append("-object")
+                        filenames.extend(data["filenames"])
+                except KeyError:
+                    pass
+            rust_so = glob.glob(
+                f"{session.virtualenv.location}/lib/**/site-packages"
+                f"/cryptography/hazmat/bindings/_rust_abi3.so"
+            )
+            with open("../../cov.lcov", "wb") as f:
+                session.run(
+                    "cargo",
+                    "cov",
+                    "--",
+                    "export",
+                    *rust_so,
+                    *filenames,
+                    "-instr-profile=rust-cov.profdata",
+                    "--ignore-filename-regex='/.cargo/'",
+                    "--ignore-filename-regex='/rustc/'",
+                    "--ignore-filename-regex='/.rustup/toolchains/'",
+                    "--format=lcov",
+                    external=True,
+                    stdout=f,
+                )
